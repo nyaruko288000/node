@@ -1,0 +1,221 @@
+name: Build Node.js for Android ARM64 (Your CPU Optimized)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_current:
+        description: 'Build Current version'
+        type: boolean
+        default: true
+      build_lts:
+        description: 'Build LTS version'
+        type: boolean
+        default: true
+      android_api:
+        description: 'Android API level'
+        type: string
+        default: '28'
+
+  schedule:
+    - cron: '0 0 * * 1'
+
+env:
+  NDK_VERSION: 'r27'
+  ANDROID_API: ${{ inputs.android_api || '28' }}
+
+jobs:
+  get-versions:
+    runs-on: ubuntu-latest
+    outputs:
+      current: ${{ steps.v.outputs.current }}
+      lts: ${{ steps.v.outputs.lts }}
+    steps:
+      - name: Get versions
+        id: v
+        run: |
+          JSON=$(curl -sS "https://nodejs.org/dist/index.json")
+          CURRENT=$(echo "$JSON" | jq -r '.[0].version')
+          LTS=$(echo "$JSON" | jq -r '[.[] | select(.lts != false)] | .[0].version')
+          echo "current=$CURRENT" >> $GITHUB_OUTPUT
+          echo "lts=$LTS" >> $GITHUB_OUTPUT
+          echo "Current: $CURRENT, LTS: $LTS"
+
+  build:
+    needs: get-versions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - type: current
+            version: ${{ needs.get-versions.outputs.current }}
+            enabled: ${{ inputs.build_current != false }}
+          - type: lts
+            version: ${{ needs.get-versions.outputs.lts }}
+            enabled: ${{ inputs.build_lts != false }}
+    
+    steps:
+      - name: Skip check
+        if: ${{ matrix.enabled != true && matrix.enabled != 'true' }}
+        run: echo "Skipping ${{ matrix.type }}" && exit 0
+
+      - name: Build info
+        run: |
+          echo "Building Node.js ${{ matrix.version }} (${{ matrix.type }})"
+
+      - name: Free space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo apt-get clean
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git python3 ninja-build \
+            ccache patchelf wget curl unzip xz-utils jq
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: node-${{ matrix.version }}-arm64
+          max-size: 3G
+
+      - name: Download NDK
+        run: |
+          wget -q "https://dl.google.com/android/repository/android-ndk-${{ env.NDK_VERSION }}-linux.zip" -O ndk.zip
+          unzip -q ndk.zip && rm ndk.zip
+          echo "NDK=$PWD/android-ndk-${{ env.NDK_VERSION }}" >> $GITHUB_ENV
+
+      - name: Clone Node.js
+        run: |
+          git clone --depth 1 --branch ${{ matrix.version }} \
+            https://github.com/nodejs/node.git src
+
+      - name: Build
+        run: |
+          cd src
+          
+          TC="${{ env.NDK }}/toolchains/llvm/prebuilt/linux-x86_64"
+          TGT="aarch64-linux-android${{ env.ANDROID_API }}"
+          
+          export CC="$TC/bin/${TGT}-clang"
+          export CXX="$TC/bin/${TGT}-clang++"
+          export AR="$TC/bin/llvm-ar"
+          export RANLIB="$TC/bin/llvm-ranlib"
+          export STRIP="$TC/bin/llvm-strip"
+          export LD="$TC/bin/ld.lld"
+          export LINK="$CXX"
+          
+          # 完整架构特性（Cortex-A520/A720/X4）
+          ARCH="-march=armv9.2-a"
+          ARCH="$ARCH+crc+crypto+sha3+sm4"
+          ARCH="$ARCH+dotprod+i8mm+bf16"
+          ARCH="$ARCH+fp16+fp16fml+rcpc"
+          ARCH="$ARCH+flagm+sb+pauth+bti"
+          ARCH="$ARCH+jscvt+fcma+rdm+dit"
+          ARCH="$ARCH+nosve+nosve2"
+          ARCH="$ARCH -mtune=generic"
+          
+          OPT="-O3 -flto=thin -funroll-loops -fno-plt"
+          OPT="$OPT -fomit-frame-pointer -fvisibility=hidden"
+          OPT="$OPT -fvisibility-inlines-hidden -falign-functions=32"
+          OPT="$OPT -ffunction-sections -fdata-sections"
+          OPT="$OPT -fmerge-all-constants -fno-semantic-interposition"
+          
+          LLVM="-mllvm -polly -mllvm -polly-vectorizer=stripmine"
+          LLVM="$LLVM -mllvm -polly-tiling=true"
+          LLVM="$LLVM -mllvm -inline-threshold=1500"
+          LLVM="$LLVM -mllvm -unroll-threshold=500"
+          LLVM="$LLVM -mllvm -enable-loop-flatten"
+          LLVM="$LLVM -mllvm -enable-loopinterchange"
+          LLVM="$LLVM -mllvm -enable-unroll-and-jam"
+          
+          export CFLAGS="-fPIC $ARCH $OPT $LLVM -DNDEBUG"
+          export CXXFLAGS="$CFLAGS -std=c++20"
+          
+          export LDFLAGS="-fPIC -flto=thin -fuse-ld=lld"
+          export LDFLAGS="$LDFLAGS -Wl,-O3 -Wl,--icf=all"
+          export LDFLAGS="$LDFLAGS -Wl,--gc-sections -Wl,--as-needed"
+          export LDFLAGS="$LDFLAGS -Wl,--lto-O3"
+          export LDFLAGS="$LDFLAGS -Wl,-mllvm,-inline-threshold=1500"
+          export LDFLAGS="$LDFLAGS -Wl,-mllvm,-unroll-threshold=500"
+          export LDFLAGS="$LDFLAGS -s"
+          
+          export PATH="/usr/lib/ccache:$PATH"
+          export CC_host="ccache gcc"
+          export CXX_host="ccache g++"
+          
+          ./configure \
+            --dest-cpu=arm64 \
+            --dest-os=android \
+            --cross-compiling \
+            --ninja \
+            --enable-lto \
+            --without-snapshot \
+            --without-inspector \
+            --without-intl \
+            --without-npm \
+            --without-corepack \
+            --without-dtrace \
+            --without-etw \
+            --partly-static \
+            --enable-static
+          
+          ninja -C out/Release -j$(nproc) node
+          $STRIP --strip-all out/Release/node
+          
+          ls -lh out/Release/node
+          file out/Release/node
+
+      - name: Package
+        run: |
+          NAME="node-${{ matrix.version }}-android-arm64-${{ matrix.type }}"
+          mkdir -p "dist/$NAME/bin"
+          cp src/out/Release/node "dist/$NAME/bin/"
+          
+          cat > "dist/$NAME/BUILD_INFO.txt" << EOF
+          Node.js ${{ matrix.version }} (${{ matrix.type }})
+          Target: Android ARM64 (Cortex-A520/A720/X4 optimized)
+          Arch: ARMv9.2-A + crypto + sha3 + sm4 + i8mm + bf16 + jscvt + nosve
+          API: ${{ env.ANDROID_API }}
+          Built: $(date -u)
+          EOF
+          
+          cd dist && tar -cJf "${NAME}.tar.xz" "$NAME"
+          sha256sum "${NAME}.tar.xz" > "${NAME}.tar.xz.sha256"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-${{ matrix.version }}-${{ matrix.type }}
+          path: dist/*.tar.xz*
+          retention-days: 90
+
+  release:
+    needs: [get-versions, build]
+    if: always() && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: "Node.js Android ARM64 #${{ github.run_number }}"
+          body: |
+            ## Versions
+            - Current: ${{ needs.get-versions.outputs.current }}
+            - LTS: ${{ needs.get-versions.outputs.lts }}
+            
+            ## Optimized for
+            Cortex-A520 + Cortex-A720 + Cortex-X4 (ARMv9.2)
+            
+            ## Features
+            `crc+crypto+sha3+sm4+dotprod+i8mm+bf16+fp16+jscvt+fcma+rdm+pauth+bti+nosve+nosve2`
+          files: artifacts/**/*
